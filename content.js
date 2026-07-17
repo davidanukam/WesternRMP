@@ -5,10 +5,12 @@
     const SUBJECT_SELECTOR = "select#Subject.form-control";
     const MAX_CONCURRENT_REQUESTS = 4;
     const SCAN_DEBOUNCE_MS = 150;
+    const TOOLTIP_HIDE_DELAY_MS = 250;
 
     const resultCache = new Map();
     const inFlightRequests = new Map();
     const processedTextNodes = new WeakSet();
+    const hideTimers = new WeakMap();
     const requestQueue = [];
     let activeRequests = 0;
     let scanTimer;
@@ -51,6 +53,7 @@
                 text-align: left;
                 width: 350px;
                 z-index: 2147483647;
+                cursor: default;
             }
             .professor-tooltip[hidden] {
                 display: none;
@@ -100,6 +103,7 @@
             }
             .professor-tooltip a {
                 color: #075985;
+                cursor: pointer;
                 text-decoration: underline;
             }
             .westernrmp-retry {
@@ -331,26 +335,47 @@
 
     function positionTooltip(wrapper, tooltip) {
         const margin = 8;
+        const bridge = 2;
         const triggerRect = wrapper.getBoundingClientRect();
         const tooltipRect = tooltip.getBoundingClientRect();
         const left = Math.min(
             Math.max(margin, triggerRect.left + (triggerRect.width - tooltipRect.width) / 2),
             window.innerWidth - tooltipRect.width - margin
         );
-        const top = triggerRect.top >= tooltipRect.height + margin
-            ? triggerRect.top - tooltipRect.height - margin
-            : Math.min(triggerRect.bottom + margin, window.innerHeight - tooltipRect.height - margin);
+        const placeAbove = triggerRect.top >= tooltipRect.height + bridge;
+        const top = placeAbove
+            ? triggerRect.top - tooltipRect.height - bridge
+            : Math.min(triggerRect.bottom + bridge, window.innerHeight - tooltipRect.height - margin);
 
         tooltip.style.left = `${Math.max(margin, left)}px`;
         tooltip.style.top = `${Math.max(margin, top)}px`;
+        tooltip.dataset.placement = placeAbove ? "above" : "below";
+    }
+
+    function cancelHideTooltip(wrapper) {
+        const timer = hideTimers.get(wrapper);
+        if (timer) {
+            clearTimeout(timer);
+            hideTimers.delete(wrapper);
+        }
     }
 
     function hideTooltip(wrapper, tooltip) {
+        cancelHideTooltip(wrapper);
         tooltip.hidden = true;
         wrapper.setAttribute("aria-expanded", "false");
     }
 
+    function scheduleHideTooltip(wrapper, tooltip) {
+        cancelHideTooltip(wrapper);
+        hideTimers.set(wrapper, setTimeout(() => {
+            hideTimers.delete(wrapper);
+            hideTooltip(wrapper, tooltip);
+        }, TOOLTIP_HIDE_DELAY_MS));
+    }
+
     function showTooltip(wrapper, tooltip) {
+        cancelHideTooltip(wrapper);
         document.querySelectorAll(".professor-name-wrapper[aria-expanded='true']").forEach((openWrapper) => {
             if (openWrapper !== wrapper) {
                 const openTooltip = openWrapper.querySelector(".professor-tooltip");
@@ -363,14 +388,23 @@
     }
 
     function attachTooltipInteractions(wrapper, tooltip) {
-        wrapper.addEventListener("mouseenter", () => showTooltip(wrapper, tooltip));
-        wrapper.addEventListener("mouseleave", () => hideTooltip(wrapper, tooltip));
-        wrapper.addEventListener("focus", () => showTooltip(wrapper, tooltip));
-        wrapper.addEventListener("focusout", (event) => {
-            if (!wrapper.contains(event.relatedTarget)) {
-                hideTooltip(wrapper, tooltip);
+        const keepOpen = () => showTooltip(wrapper, tooltip);
+        const maybeHide = (event) => {
+            const next = event.relatedTarget;
+            if (wrapper.contains(next) || tooltip.contains(next)) {
+                return;
             }
-        });
+            scheduleHideTooltip(wrapper, tooltip);
+        };
+
+        wrapper.addEventListener("mouseenter", keepOpen);
+        wrapper.addEventListener("mouseleave", maybeHide);
+        tooltip.addEventListener("mouseenter", keepOpen);
+        tooltip.addEventListener("mouseleave", maybeHide);
+        wrapper.addEventListener("focus", keepOpen);
+        wrapper.addEventListener("focusout", maybeHide);
+        tooltip.addEventListener("focusin", keepOpen);
+        tooltip.addEventListener("focusout", maybeHide);
         wrapper.addEventListener("click", (event) => {
             if (event.target.closest("a")) return;
             event.stopPropagation();
