@@ -1,184 +1,97 @@
-import { GRAPHQL_URL, UWO_SCHOOL_ID, AUTH_TOKEN } from "./constants.js";
-import { convertProfessorName, encodeToBase64 } from './utils/inputfiltering.js';
-import { filterProfessorResults } from './utils/outputfiltering.js';
+import { AUTH_TOKEN, GRAPHQL_URL, REQUEST_TIMEOUT_MS, UWO_SCHOOL_ID } from "./constants.js";
+import { parseTeacherSearchResponse, TEACHER_SEARCH_QUERY } from "./utils/api.js";
+import { convertProfessorName, encodeToBase64 } from "./utils/inputfiltering.js";
 
-const isGraphQLReachable = async () => {
-    try {
-      const response = await fetch(GRAPHQL_URL, { method: 'HEAD' });
-      return response.ok;
-    } catch (error) {
-      return false;
-    }
+const ERROR_MESSAGES = {
+    api_error: "RateMyProfessors could not complete the search.",
+    http_error: "RateMyProfessors is temporarily unavailable.",
+    invalid_response: "RateMyProfessors returned an unexpected response.",
+    network_error: "Could not connect to RateMyProfessors.",
+    not_found: "Professor not found.",
+    timeout: "The RateMyProfessors request timed out."
 };
 
+function failure(code, details = {}) {
+    return {
+        success: false,
+        code,
+        error: ERROR_MESSAGES[code] ?? "Unable to search for this professor.",
+        retryable: code !== "not_found",
+        ...details
+    };
+}
 
-const searchProfessor = async (professorName, schoolID, targetDepartment) => {
-    const query = `query NewSearchTeachersQuery(
-    $query: TeacherSearchQuery!) {
-        newSearch {
-            teachers(query: $query) {
-                didFallback
-                edges {
-                    cursor
-                    node {
-                        id
-                        legacyId
-                        firstName
-                        lastName
-                        avgRatingRounded
-                        numRatings
-                        wouldTakeAgainPercentRounded
-                        wouldTakeAgainCount
-                        teacherRatingTags {
-                            id
-                            legacyId
-                            tagCount
-                            tagName
-                        }
-                        mostUsefulRating {
-                            id
-                            class
-                            isForOnlineClass
-                            legacyId
-                            comment
-                            helpfulRatingRounded
-                            ratingTags
-                            grade
-                            date
-                            iWouldTakeAgain
-                            qualityRating
-                            difficultyRatingRounded
-                            teacherNote{
-                                id
-                                comment
-                                createdAt
-                                class
-                            }
-                            thumbsDownTotal
-                            thumbsUpTotal
-                        }
-                        avgDifficultyRounded
-                        school {
-                            name
-                            id
-                        }
-                        department
-                    }
-                }
-            }
-        }
-    }`;
-    
+async function searchProfessor(professorName, targetDepartment) {
+    const convertedName = convertProfessorName(professorName);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
     try {
-        console.log(`Searching for professor: ${professorName} in ${targetDepartment}`);
-        
         const response = await fetch(GRAPHQL_URL, {
-            method: 'POST',
+            method: "POST",
             headers: {
-                'Content-Type': 'application/json',
-                'Authorization': AUTH_TOKEN,
-                'Accept': 'application/json',
-                'Origin': 'https://www.ratemyprofessors.com'
+                "Accept": "application/json",
+                "Authorization": AUTH_TOKEN,
+                "Content-Type": "application/json"
             },
             body: JSON.stringify({
-                query: query,
+                query: TEACHER_SEARCH_QUERY,
                 variables: {
                     query: {
-                        text: convertProfessorName(professorName),
-                        schoolID: schoolID
+                        text: convertedName,
+                        schoolID: encodeToBase64(UWO_SCHOOL_ID)
                     }
                 }
-            })
+            }),
+            signal: controller.signal
         });
-        
+
         if (!response.ok) {
-            console.error(`API request failed with status: ${response.status}`);
-            return null;
+            return failure("http_error", { status: response.status });
         }
-        
-        const data = await response.json();
-        
-        if (!data || !data.data) {
-            console.error('API response missing data property:', data);
-            return null;
-        }
-        
-        if (!data.data.newSearch || !data.data.newSearch.teachers) {
-            console.error('API response missing newSearch.teachers:', data.data);
-            return null;
-        }
-        
-        const edges = data.data.newSearch.teachers.edges;
-        console.log("API response:", edges);
-        
-        if (edges.length === 0) {
-            console.log(`No results found for professor: ${professorName}`);
-            return null;
-        }
-        
-        const professor = filterProfessorResults(edges, convertProfessorName(professorName), targetDepartment);
-        console.log(`Found professor data:`, professor);
-        return professor;
 
+        let payload;
+        try {
+            payload = await response.json();
+        } catch {
+            return failure("invalid_response");
+        }
+
+        const result = parseTeacherSearchResponse(payload, convertedName, targetDepartment);
+        if (!result.ok) {
+            return failure(result.code);
+        }
+
+        return { success: true, professor: result.professor };
     } catch (error) {
-        console.error('Error searching for professor:', error);
-        return null;
+        return failure(error?.name === "AbortError" ? "timeout" : "network_error");
+    } finally {
+        clearTimeout(timeoutId);
     }
-};
+}
 
+function normalizeText(value, maxLength) {
+    return typeof value === "string"
+        ? value.trim().slice(0, maxLength)
+        : "";
+}
 
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    console.log("Background received message:", message);
-    
-    if (message.action === "searchProfessor") {
-        const { professorName, schoolID = encodeToBase64(UWO_SCHOOL_ID), department } = message;
-        console.log(`Processing search request for: ${professorName}, department: ${department}`);
-        
-        if (!professorName) {
-            console.error("Missing professor name in request");
-            sendResponse({ success: false, error: "Professor name is required" });
-            return true;
-        }
-        
-        searchProfessor(professorName, schoolID, department)
-            .then(professorData => {
-                if (professorData) {
-                    console.log(`Sending successful response for ${professorName}`);
-                    sendResponse({ success: true, professor: professorData });
-                } else {
-                    console.log(`Professor not found: ${professorName}`);
-                    sendResponse({ 
-                        success: false, 
-                        error: "Professor not found",
-                        searchTerm: professorName,
-                        convertedName: convertProfessorName(professorName)
-                    });
-                }
-            })
-            .catch(error => {
-                console.error(`Error in searchProfessor for ${professorName}:`, error);
-                sendResponse({ 
-                    success: false, 
-                    error: "Error searching for professor: " + error.message 
-                });
-            });
-        
-        return true; // indicates we send a response asynchronously
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (!message || message.action !== "searchProfessor") {
+        return false;
     }
-    
-    return false;
+
+    const professorName = normalizeText(message.professorName, 120);
+    const department = normalizeText(message.department, 120);
+
+    if (!professorName) {
+        sendResponse(failure("invalid_response", {
+            error: "Professor name is required.",
+            retryable: false
+        }));
+        return false;
+    }
+
+    searchProfessor(professorName, department).then(sendResponse);
+    return true;
 });
-
-// test api on background script load
-/*
-(async () => {
-    console.log("Testing API connection...");
-    try {
-        const testResult = await searchProfessor("K. Linton", encodeToBase64(UWO_SCHOOL_ID), "Anthropology");
-    } catch (error) {
-        console.error("Test API error:", error);
-    }
-})();
-*/
-
-console.log("Background script loaded, listening.");

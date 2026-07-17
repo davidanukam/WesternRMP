@@ -1,244 +1,501 @@
-function scanPageForProfessors() {
-    const tables = document.querySelectorAll('.table.table-condensed.table-hover');
-    
-    tables.forEach(table => {
-        const rows = table.querySelectorAll('tr');
-        
-        rows.forEach(row => {
-            const professorCell = row.querySelectorAll('td')[3];
-            
-            if (professorCell && professorCell.childNodes.length > 0) { // child node is text or br
-                const professorNames = extractProfessorNames(professorCell);
-                const department = extractDepartment();
+(() => {
+    "use strict";
 
-                professorNames.forEach(name => {
-                    if (name) {
-                        console.log(`Found professor: ${name}`);
-                        displayProfessorRating(professorCell, name, department); // bake in a 200ms delay here
-                    }
-                });
-            }
-        });
-    });
-}
+    const TABLE_SELECTOR = ".table.table-condensed.table-hover";
+    const SUBJECT_SELECTOR = "select#Subject.form-control";
+    const MAX_CONCURRENT_REQUESTS = 4;
+    const SCAN_DEBOUNCE_MS = 150;
 
-function extractDepartment() {
-    const selectElement = document.querySelector('select#Subject.form-control');
-    
-    if (selectElement) {
-        const selectedOption = selectElement.options[selectElement.selectedIndex];
-        if (selectedOption) {
-            return selectedOption.text.trim();
-        }
-    }
-    
-    return ""; // if no dept found
-}
+    const resultCache = new Map();
+    const inFlightRequests = new Map();
+    const processedTextNodes = new WeakSet();
+    const requestQueue = [];
+    let activeRequests = 0;
+    let scanTimer;
+    let tooltipSequence = 0;
 
-function extractProfessorNames(cell) {
-    const names = [];
-    let currentName = '';
-    
-    cell.childNodes.forEach(node => {
-
-        if (node.nodeType === Node.TEXT_NODE) {
-            const text = node.textContent.trim();
-            if (text) {
-                currentName = text;
-            }
-        } else if (node.nodeName === 'BR' && currentName) { // br element signals the end of a professor name
-            names.push(currentName);
-            currentName = '';
-        }
-    });
-    
-    if (currentName) {
-        names.push(currentName);
-    }
-    
-    return names;
-}
-
-
-function getProfessorData(professorName, department) {
-    return new Promise((resolve, reject) => {
-        chrome.runtime.sendMessage({
-            action: "searchProfessor",
-            professorName: professorName,
-            department: department
-        }, response => {
-            if (chrome.runtime.lastError) {
-                reject(chrome.runtime.lastError);
-                return;
-            }
-            
-            if (response.success) {
-                resolve(response.professor);
-            } else {
-                reject(new Error(response.error || "Unknown error"));
-            }
-        });
-    });
-}
-
-// add tooltips with professor info
-async function displayProfessorRating(professorCell, professorName, department) {
-    try {
-        const professorData = await getProfessorData(professorName, department);
-        console.log(`Professor ${professorName} data:`, professorData.node);
-        data = professorData.node;
-
-        const textNodes = Array.from(professorCell.childNodes)
-            .filter(node => node.nodeType === Node.TEXT_NODE);
-        
-        let targetNode = null;
-        for (const textNode of textNodes) {
-            if (textNode.textContent.trim() === professorName) {
-                targetNode = textNode;
-                break;
-            }
-        }
-        
-        if (!targetNode) {
-            console.warn(`Could not find text node for professor: ${professorName}`);
+    function injectStyles() {
+        if (document.getElementById("westernrmp-styles")) {
             return;
         }
-        
-        // wrapper to replace text node
-        const wrapperSpan = document.createElement('span');
-        wrapperSpan.className = 'professor-name-wrapper';
-        wrapperSpan.textContent = professorName;
-        wrapperSpan.style.position = 'relative';
-        wrapperSpan.style.cursor = 'default';
-        wrapperSpan.style.borderBottom = '1px dotted #666';
-        
-        // tooltip
-        const tooltip = document.createElement('div');
-        tooltip.className = 'professor-tooltip';
-        tooltip.style.display = 'none';
-        tooltip.style.position = 'absolute';
-        tooltip.style.bottom = '100%';
-        tooltip.style.left = '50%';
-        tooltip.style.transform = 'translateX(-50%)';
-        tooltip.style.width = '350px';
-        tooltip.style.backgroundColor = 'white';
-        tooltip.style.border = '1px solid #ccc';
-        tooltip.style.borderRadius = '4px';
-        tooltip.style.boxShadow = '0 2px 8px rgba(0,0,0,0.15)';
-        tooltip.style.padding = '12px';
-        tooltip.style.zIndex = '1000';
-        tooltip.style.fontSize = '14px';
-        tooltip.style.color = '#333';
-        
-        // format professor data for tooltip
-        const fullName = `${data.firstName} ${data.lastName}`;
-        const professorId = data.legacyId;
-        const professorLink = `https://www.ratemyprofessors.com/professor/${professorId}`;
-        const avgRating = data.avgRatingRounded.toFixed(2) || 'N/A';
-        const numRatings = data.numRatings || 0;
-        const wouldTakeAgain = data.wouldTakeAgainPercentRounded !== null 
-            ? `${data.wouldTakeAgainPercentRounded.toFixed(1)}%` 
-            : 'N/A';
-        const avgDifficulty = data.avgDifficultyRounded.toFixed(2) || 'N/A';
-        const profDepartment = data.department || department || 'N/A';
-        
-        // get most useful rating if available
-        let mostUsefulRatingHTML = '<p>No ratings available</p>';
-        if (data.mostUsefulRating) {
-            const rating = data.mostUsefulRating;
-            const date = rating.date ? new Date(rating.date).toLocaleDateString() : 'Unknown date';
-            const comment = rating.comment || 'No comment provided';
-            const course = rating.class || 'Unknown course';
-            const quality = rating.qualityRating || 'N/A';
-            
-            mostUsefulRatingHTML = `
-                <div class="most-useful-rating">
-                    <p><strong>Course:</strong> ${course}</p>
-                    <p><strong>Rating:</strong> ${quality}/5 (${date})</p>
-                    <p><strong>Comment:</strong> "${comment.substring(0, 150)}${comment.length > 150 ? '...' : ''}"</p>
-                </div>
-            `;
-        }
-        
-        // top tags
-        let tagsHTML = '';
-        if (data.teacherRatingTags && data.teacherRatingTags.length > 0) {
-            const topTags = data.teacherRatingTags
-                .sort((a, b) => b.tagCount - a.tagCount)
-                .slice(0, 3);
-                
-            tagsHTML = `
-                <div class="top-tags">
-                    <p><strong>Top Tags:</strong> ${topTags.map(tag => tag.tagName).join(', ')}</p>
-                </div>
-            `;
-        }
-        
-        // add tooltip content
-        tooltip.innerHTML = `
-            <div class="tooltip-header" style="margin-bottom:8px; border-bottom:1px solid #eee; padding-bottom:8px;">
-                <h3 style="margin:0; font-size:16px;">${fullName}</h3>
-                <p style="margin:4px 0 0 0; color:#666;">${profDepartment}</p>
-            </div>
-            <div class="tooltip-body">
-                <div class="rating-stats" style="display:flex; justify-content:space-between; margin-bottom:10px;">
-                    <div>
-                        <p style="margin:0;"><strong>Overall:</strong> <span style="color:#2196F3; font-weight:bold;">${avgRating}/5</span></p>
-                        <p style="margin:4px 0 0 0;"><strong>Difficulty:</strong> ${avgDifficulty}/5</p>
-                    </div>
-                    <div>
-                        <p style="margin:0;"><strong>Would take again:</strong> ${wouldTakeAgain}</p>
-                        <p style="margin:4px 0 0 0;"><strong>Total ratings:</strong> ${numRatings}</p>
-                    </div>
-                </div>
-                ${tagsHTML}
-                <div class="most-useful" style="margin-top:10px; border-top:1px solid #eee; padding-top:8px;">
-                    <h4 style="margin:0 0 8px 0; font-size:15px; font-weight:bold; color:#2196F3; border-bottom:1px solid #e0e0e0; padding-bottom:4px;">Most Helpful Rating</h4>
-                    ${mostUsefulRatingHTML}
-                </div>
-            </div>
-            <div class="tooltip-footer" style="margin-top:8px; font-size:12px; color:#666; text-align:right;">
-                <p style="margin:0;"><a href="${professorLink}" target="_blank">Data from RateMyProfessors.com</a></p>
-            </div>
+
+        const style = document.createElement("style");
+        style.id = "westernrmp-styles";
+        style.textContent = `
+            .professor-name-wrapper {
+                border-bottom: 1px dotted currentColor;
+                cursor: pointer;
+                display: inline;
+                outline-offset: 3px;
+            }
+            .professor-name-wrapper:focus-visible {
+                outline: 2px solid #075985;
+            }
+            .rating-indicator {
+                font-size: 0.9em;
+                font-weight: 700;
+            }
+            .professor-tooltip {
+                background: #fff;
+                border: 1px solid #94a3b8;
+                border-radius: 6px;
+                box-shadow: 0 8px 24px rgba(15, 23, 42, 0.25);
+                color: #1f2937;
+                font-size: 14px;
+                line-height: 1.4;
+                max-height: min(70vh, 500px);
+                max-width: calc(100vw - 16px);
+                overflow: auto;
+                padding: 12px;
+                position: fixed;
+                text-align: left;
+                width: 350px;
+                z-index: 2147483647;
+            }
+            .professor-tooltip[hidden] {
+                display: none;
+            }
+            .professor-tooltip h3,
+            .professor-tooltip h4,
+            .professor-tooltip p {
+                margin: 0;
+            }
+            .professor-tooltip-header {
+                border-bottom: 1px solid #e2e8f0;
+                margin-bottom: 8px;
+                padding-bottom: 8px;
+            }
+            .professor-tooltip-header h3 {
+                font-size: 16px;
+            }
+            .professor-tooltip-department {
+                color: #475569;
+                margin-top: 4px !important;
+            }
+            .professor-tooltip-stats {
+                display: grid;
+                gap: 4px 16px;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+            .professor-tooltip-highlight,
+            .professor-tooltip h4 {
+                color: #075985;
+                font-weight: 700;
+            }
+            .professor-tooltip-section {
+                border-top: 1px solid #e2e8f0;
+                margin-top: 10px;
+                padding-top: 8px;
+            }
+            .professor-tooltip h4 {
+                border-bottom: 1px solid #e2e8f0;
+                font-size: 15px;
+                margin-bottom: 8px;
+                padding-bottom: 4px;
+            }
+            .professor-tooltip-footer {
+                font-size: 12px;
+                margin-top: 10px;
+                text-align: right;
+            }
+            .professor-tooltip a {
+                color: #075985;
+                text-decoration: underline;
+            }
+            .westernrmp-retry {
+                background: none;
+                border: 0;
+                color: #9f1239;
+                cursor: pointer;
+                font: inherit;
+                font-size: 0.85em;
+                padding: 0;
+                text-decoration: underline;
+            }
+            @media (max-width: 420px) {
+                .professor-tooltip {
+                    width: calc(100vw - 16px);
+                }
+                .professor-tooltip-stats {
+                    grid-template-columns: 1fr;
+                }
+            }
         `;
-        
-        wrapperSpan.appendChild(tooltip);
-        
-        targetNode.parentNode.replaceChild(wrapperSpan, targetNode);
-        
-        // show/hide tooltip
-        wrapperSpan.addEventListener('mouseenter', () => {
-            tooltip.style.display = 'block';
-        });
-        
-        wrapperSpan.addEventListener('mouseleave', () => {
-            tooltip.style.display = 'none';
-        });
-        
-        // indicator that a professor has rating
-        const ratingIndicator = document.createElement('span');
-        ratingIndicator.className = 'rating-indicator';
-        ratingIndicator.textContent = ` (${avgRating})`;
-        ratingIndicator.style.color = getRatingColor(avgRating);
-        ratingIndicator.style.fontWeight = 'bold';
-        ratingIndicator.style.fontSize = '0.9em';
-        wrapperSpan.appendChild(ratingIndicator);
-        
-    } catch (error) {
-        console.error(`Error getting rating for ${professorName}:`, error);
+        (document.head || document.documentElement).appendChild(style);
     }
-}
 
+    function extractDepartment() {
+        const selectElement = document.querySelector(SUBJECT_SELECTOR);
+        return selectElement?.selectedOptions?.[0]?.textContent?.trim() ?? "";
+    }
 
-function getRatingColor(rating) {
-    rating = parseFloat(rating);
-    if (isNaN(rating)) return '#999'; // gray for N/A
-    
-    if (rating >= 4.5) return '#4CAF50'; // green
-    if (rating >= 3.5) return '#8BC34A'; // light green
-    if (rating >= 2.5) return '#FFC107'; // amber
-    if (rating >= 1.5) return '#FF9800'; // orange
-    return '#F44336'; // red
-}
+    function extractProfessorEntries(cell) {
+        return Array.from(cell.childNodes)
+            .filter((node) => node.nodeType === Node.TEXT_NODE)
+            .map((node) => ({ name: node.textContent.trim(), node }))
+            .filter((entry) => entry.name.length > 0);
+    }
 
-scanPageForProfessors();
+    function cacheKey(professorName, department) {
+        return `${professorName.toLocaleLowerCase()}|${department.toLocaleLowerCase()}`;
+    }
+
+    function drainRequestQueue() {
+        while (activeRequests < MAX_CONCURRENT_REQUESTS && requestQueue.length > 0) {
+            const { task, resolve, reject } = requestQueue.shift();
+            activeRequests += 1;
+
+            Promise.resolve()
+                .then(task)
+                .then(resolve, reject)
+                .finally(() => {
+                    activeRequests -= 1;
+                    drainRequestQueue();
+                });
+        }
+    }
+
+    function scheduleRequest(task) {
+        return new Promise((resolve, reject) => {
+            requestQueue.push({ task, resolve, reject });
+            drainRequestQueue();
+        });
+    }
+
+    function sendProfessorRequest(professorName, department) {
+        return new Promise((resolve, reject) => {
+            chrome.runtime.sendMessage({
+                action: "searchProfessor",
+                professorName,
+                department
+            }, (response) => {
+                if (chrome.runtime.lastError) {
+                    const error = new Error(chrome.runtime.lastError.message);
+                    error.code = "runtime_error";
+                    error.retryable = true;
+                    reject(error);
+                    return;
+                }
+
+                if (response?.success && response.professor?.node) {
+                    resolve(response.professor.node);
+                    return;
+                }
+
+                const error = new Error(response?.error || "Unable to search for this professor.");
+                error.code = response?.code || "invalid_response";
+                error.retryable = response?.retryable !== false;
+                reject(error);
+            });
+        });
+    }
+
+    function getProfessorData(professorName, department) {
+        const key = cacheKey(professorName, department);
+        if (resultCache.has(key)) {
+            return Promise.resolve(resultCache.get(key));
+        }
+
+        if (inFlightRequests.has(key)) {
+            return inFlightRequests.get(key);
+        }
+
+        const request = scheduleRequest(() => sendProfessorRequest(professorName, department))
+            .then((professor) => {
+                resultCache.set(key, professor);
+                return professor;
+            })
+            .finally(() => {
+                inFlightRequests.delete(key);
+            });
+
+        inFlightRequests.set(key, request);
+        return request;
+    }
+
+    function formatNumber(value, digits = 1) {
+        const number = Number(value);
+        return Number.isFinite(number) ? number.toFixed(digits) : "N/A";
+    }
+
+    function getRatingColor(value) {
+        const rating = Number(value);
+        if (!Number.isFinite(rating)) return "#475569";
+        if (rating >= 4.5) return "#166534";
+        if (rating >= 3.5) return "#3f6212";
+        if (rating >= 2.5) return "#854d0e";
+        if (rating >= 1.5) return "#9a3412";
+        return "#b91c1c";
+    }
+
+    function appendLabelValue(container, label, value, valueClass) {
+        const paragraph = document.createElement("p");
+        const strong = document.createElement("strong");
+        strong.textContent = `${label}: `;
+        paragraph.append(strong);
+
+        const valueElement = document.createElement("span");
+        valueElement.textContent = value;
+        if (valueClass) {
+            valueElement.className = valueClass;
+        }
+        paragraph.append(valueElement);
+        container.append(paragraph);
+    }
+
+    function buildTooltip(data, fallbackDepartment) {
+        const tooltip = document.createElement("div");
+        const tooltipId = `westernrmp-tooltip-${++tooltipSequence}`;
+        tooltip.id = tooltipId;
+        tooltip.className = "professor-tooltip";
+        tooltip.hidden = true;
+        tooltip.setAttribute("role", "dialog");
+        tooltip.setAttribute("aria-label", "RateMyProfessors details");
+
+        const header = document.createElement("div");
+        header.className = "professor-tooltip-header";
+        const heading = document.createElement("h3");
+        const fullName = [data.firstName, data.lastName].filter((part) => typeof part === "string").join(" ").trim();
+        heading.textContent = fullName || "Professor rating";
+        const department = document.createElement("p");
+        department.className = "professor-tooltip-department";
+        department.textContent = data.department || fallbackDepartment || "Department unavailable";
+        header.append(heading, department);
+
+        const stats = document.createElement("div");
+        stats.className = "professor-tooltip-stats";
+        appendLabelValue(stats, "Overall", `${formatNumber(data.avgRatingRounded, 1)}/5`, "professor-tooltip-highlight");
+        appendLabelValue(stats, "Difficulty", `${formatNumber(data.avgDifficultyRounded, 1)}/5`);
+        const takeAgain = Number.isFinite(Number(data.wouldTakeAgainPercentRounded))
+            ? `${formatNumber(data.wouldTakeAgainPercentRounded, 1)}%`
+            : "N/A";
+        appendLabelValue(stats, "Would take again", takeAgain);
+        appendLabelValue(stats, "Total ratings", Number.isFinite(Number(data.numRatings)) ? String(data.numRatings) : "0");
+
+        tooltip.append(header, stats);
+
+        const tags = Array.isArray(data.teacherRatingTags)
+            ? [...data.teacherRatingTags]
+                .filter((tag) => typeof tag?.tagName === "string")
+                .sort((a, b) => Number(b.tagCount) - Number(a.tagCount))
+                .slice(0, 3)
+                .map((tag) => tag.tagName.trim())
+                .filter(Boolean)
+            : [];
+        if (tags.length > 0) {
+            const tagsSection = document.createElement("div");
+            tagsSection.className = "professor-tooltip-section";
+            appendLabelValue(tagsSection, "Top tags", tags.join(", "));
+            tooltip.append(tagsSection);
+        }
+
+        const ratingSection = document.createElement("div");
+        ratingSection.className = "professor-tooltip-section";
+        const ratingHeading = document.createElement("h4");
+        ratingHeading.textContent = "Most Helpful Rating";
+        ratingSection.append(ratingHeading);
+
+        const rating = data.mostUsefulRating;
+        if (rating && typeof rating === "object") {
+            appendLabelValue(ratingSection, "Course", rating.class || "Unknown course");
+            const dateValue = rating.date ? new Date(rating.date) : null;
+            const formattedDate = dateValue && !Number.isNaN(dateValue.getTime())
+                ? dateValue.toLocaleDateString()
+                : "Unknown date";
+            appendLabelValue(ratingSection, "Rating", `${formatNumber(rating.qualityRating, 1)}/5 (${formattedDate})`);
+            const rawComment = typeof rating.comment === "string" ? rating.comment : "No comment provided";
+            const comment = rawComment.length > 150 ? `${rawComment.slice(0, 150)}…` : rawComment;
+            appendLabelValue(ratingSection, "Comment", comment);
+        } else {
+            const empty = document.createElement("p");
+            empty.textContent = "No ratings available.";
+            ratingSection.append(empty);
+        }
+        tooltip.append(ratingSection);
+
+        const professorId = String(data.legacyId ?? "");
+        if (/^\d+$/.test(professorId)) {
+            const footer = document.createElement("div");
+            footer.className = "professor-tooltip-footer";
+            const link = document.createElement("a");
+            link.href = `https://www.ratemyprofessors.com/professor/${professorId}`;
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+            link.textContent = "View on RateMyProfessors.com";
+            footer.append(link);
+            tooltip.append(footer);
+        }
+
+        return { tooltip, tooltipId };
+    }
+
+    function positionTooltip(wrapper, tooltip) {
+        const margin = 8;
+        const triggerRect = wrapper.getBoundingClientRect();
+        const tooltipRect = tooltip.getBoundingClientRect();
+        const left = Math.min(
+            Math.max(margin, triggerRect.left + (triggerRect.width - tooltipRect.width) / 2),
+            window.innerWidth - tooltipRect.width - margin
+        );
+        const top = triggerRect.top >= tooltipRect.height + margin
+            ? triggerRect.top - tooltipRect.height - margin
+            : Math.min(triggerRect.bottom + margin, window.innerHeight - tooltipRect.height - margin);
+
+        tooltip.style.left = `${Math.max(margin, left)}px`;
+        tooltip.style.top = `${Math.max(margin, top)}px`;
+    }
+
+    function hideTooltip(wrapper, tooltip) {
+        tooltip.hidden = true;
+        wrapper.setAttribute("aria-expanded", "false");
+    }
+
+    function showTooltip(wrapper, tooltip) {
+        document.querySelectorAll(".professor-name-wrapper[aria-expanded='true']").forEach((openWrapper) => {
+            if (openWrapper !== wrapper) {
+                const openTooltip = openWrapper.querySelector(".professor-tooltip");
+                if (openTooltip) hideTooltip(openWrapper, openTooltip);
+            }
+        });
+        tooltip.hidden = false;
+        wrapper.setAttribute("aria-expanded", "true");
+        requestAnimationFrame(() => positionTooltip(wrapper, tooltip));
+    }
+
+    function attachTooltipInteractions(wrapper, tooltip) {
+        wrapper.addEventListener("mouseenter", () => showTooltip(wrapper, tooltip));
+        wrapper.addEventListener("mouseleave", () => hideTooltip(wrapper, tooltip));
+        wrapper.addEventListener("focus", () => showTooltip(wrapper, tooltip));
+        wrapper.addEventListener("focusout", (event) => {
+            if (!wrapper.contains(event.relatedTarget)) {
+                hideTooltip(wrapper, tooltip);
+            }
+        });
+        wrapper.addEventListener("click", (event) => {
+            if (event.target.closest("a")) return;
+            event.stopPropagation();
+            tooltip.hidden ? showTooltip(wrapper, tooltip) : hideTooltip(wrapper, tooltip);
+        });
+        wrapper.addEventListener("keydown", (event) => {
+            if (event.key === "Escape") {
+                hideTooltip(wrapper, tooltip);
+                wrapper.focus();
+            } else if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                tooltip.hidden ? showTooltip(wrapper, tooltip) : hideTooltip(wrapper, tooltip);
+            }
+        });
+    }
+
+    function renderProfessorRating(targetNode, professorName, department, data) {
+        if (!targetNode.isConnected || targetNode.parentElement?.closest(".professor-name-wrapper")) {
+            return;
+        }
+
+        const wrapper = document.createElement("span");
+        wrapper.className = "professor-name-wrapper";
+        wrapper.dataset.professorName = professorName;
+        wrapper.tabIndex = 0;
+        wrapper.setAttribute("role", "button");
+        wrapper.setAttribute("aria-haspopup", "dialog");
+        wrapper.setAttribute("aria-expanded", "false");
+
+        const name = document.createElement("span");
+        name.textContent = professorName;
+        const ratingIndicator = document.createElement("span");
+        ratingIndicator.className = "rating-indicator";
+        ratingIndicator.style.color = getRatingColor(data.avgRatingRounded);
+        ratingIndicator.textContent = ` (${formatNumber(data.avgRatingRounded, 1)})`;
+
+        const { tooltip, tooltipId } = buildTooltip(data, department);
+        wrapper.setAttribute("aria-controls", tooltipId);
+        wrapper.append(name, ratingIndicator, tooltip);
+        attachTooltipInteractions(wrapper, tooltip);
+        targetNode.replaceWith(wrapper);
+    }
+
+    function renderRetry(targetNode, professorName, department, error) {
+        if (!targetNode.isConnected || targetNode.nextSibling?.classList?.contains("westernrmp-retry")) {
+            return;
+        }
+
+        const retry = document.createElement("button");
+        retry.type = "button";
+        retry.className = "westernrmp-retry";
+        retry.textContent = " (retry rating)";
+        retry.title = error.message;
+        retry.setAttribute("aria-label", `Retry rating lookup for ${professorName}`);
+        retry.addEventListener("click", () => {
+            retry.remove();
+            processedTextNodes.delete(targetNode);
+            processEntry({ name: professorName, node: targetNode }, department);
+        }, { once: true });
+        targetNode.after(retry);
+    }
+
+    async function processEntry(entry, department) {
+        if (processedTextNodes.has(entry.node)) {
+            return;
+        }
+        processedTextNodes.add(entry.node);
+
+        try {
+            const data = await getProfessorData(entry.name, department);
+            renderProfessorRating(entry.node, entry.name, department, data);
+        } catch (error) {
+            if (error.code !== "not_found" && error.retryable) {
+                renderRetry(entry.node, entry.name, department, error);
+            }
+        }
+    }
+
+    function scanPageForProfessors() {
+        const department = extractDepartment();
+        document.querySelectorAll(TABLE_SELECTOR).forEach((table) => {
+            table.querySelectorAll("tr").forEach((row) => {
+                const professorCell = row.cells?.[3];
+                if (!professorCell) return;
+                extractProfessorEntries(professorCell).forEach((entry) => {
+                    processEntry(entry, department);
+                });
+            });
+        });
+    }
+
+    function scheduleScan() {
+        clearTimeout(scanTimer);
+        scanTimer = setTimeout(scanPageForProfessors, SCAN_DEBOUNCE_MS);
+    }
+
+    function resetEnhancements() {
+        document.querySelectorAll(".professor-name-wrapper").forEach((wrapper) => {
+            wrapper.replaceWith(document.createTextNode(wrapper.dataset.professorName || ""));
+        });
+        document.querySelectorAll(".westernrmp-retry").forEach((retry) => retry.remove());
+        scheduleScan();
+    }
+
+    injectStyles();
+    scanPageForProfessors();
+
+    const observer = new MutationObserver(scheduleScan);
+    observer.observe(document.body, { childList: true, subtree: true });
+    document.addEventListener("change", (event) => {
+        if (event.target.matches?.(SUBJECT_SELECTOR)) {
+            resetEnhancements();
+        }
+    });
+    document.addEventListener("click", () => {
+        document.querySelectorAll(".professor-name-wrapper[aria-expanded='true']").forEach((wrapper) => {
+            const tooltip = wrapper.querySelector(".professor-tooltip");
+            if (tooltip) hideTooltip(wrapper, tooltip);
+        });
+    });
+    window.addEventListener("resize", scheduleScan, { passive: true });
+    window.addEventListener("scroll", () => {
+        document.querySelectorAll(".professor-name-wrapper[aria-expanded='true']").forEach((wrapper) => {
+            const tooltip = wrapper.querySelector(".professor-tooltip");
+            if (tooltip) positionTooltip(wrapper, tooltip);
+        });
+    }, { passive: true });
+})();
